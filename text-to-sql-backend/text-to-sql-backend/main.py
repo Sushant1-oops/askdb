@@ -1,53 +1,68 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import uvicorn
 from datetime import datetime
-import uuid
+import logging
 
+# ---------------------------------------------------------------------------
+# Logging configuration
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Text-to-SQL API",
-    description="Natural Language to SQL Query System with Multi-Database Support",
-    version="1.0.0"
+    title="QueryForge — Text-to-SQL API",
+    description="Natural Language to SQL Query System with Multi-Database Support. "
+                "Powered by Groq Cloud AI with Llama 3.3 70B.",
+    version="2.0.0",
 )
 
-# CORS Configuration
+# ---------------------------------------------------------------------------
+# CORS — allow common dev ports
+# ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:4173",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory storage for database connections (use Redis in production)
-active_connections = {}
+# ---------------------------------------------------------------------------
+# Global exception handler — prevents raw 500 errors
+# ---------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled error on {request.method} {request.url.path}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": f"Internal server error: {str(exc)}",
+            "path": str(request.url.path),
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+    )
 
-# Models
-class DatabaseConnection(BaseModel):
-    db_type: str = Field(..., description="Database type: postgresql, mysql, or sqlite")
-    host: Optional[str] = Field(None, description="Database host")
-    port: Optional[int] = Field(None, description="Database port")
-    database: str = Field(..., description="Database name")
-    username: Optional[str] = Field(None, description="Database username")
-    password: Optional[str] = Field(None, description="Database password")
-    file_path: Optional[str] = Field(None, description="SQLite file path")
-
-class QueryRequest(BaseModel):
-    connection_id: str = Field(..., description="Connection ID")
-    question: str = Field(..., description="Natural language query")
-
-class DirectSQLRequest(BaseModel):
-    connection_id: str = Field(..., description="Connection ID")
-    sql_query: str = Field(..., description="SQL query to execute")
-
-class ExportRequest(BaseModel):
-    connection_id: str = Field(..., description="Connection ID")
-    table_name: str = Field(..., description="Table name to export")
-    format: str = Field(..., description="Export format: csv, excel, or pdf")
-
+# ---------------------------------------------------------------------------
 # Routes
+# ---------------------------------------------------------------------------
 from routers import database, query, export
 
 app.include_router(database.router, prefix="/api/database", tags=["Database"])
@@ -57,16 +72,17 @@ app.include_router(export.router, prefix="/api/export", tags=["Export"])
 @app.get("/")
 async def root():
     return {
-        "message": "Text-to-SQL API",
-        "version": "1.0.0",
-        "docs": "/docs"
+        "message": "QueryForge — Text-to-SQL API",
+        "version": "2.0.0",
+        "engine": "Groq Cloud (Llama 3.3 70B)",
+        "docs": "/docs",
     }
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
 if __name__ == "__main__":

@@ -6,10 +6,8 @@ python-multipart==0.0.6
 pandas==2.1.4
 openpyxl==3.1.2
 reportlab==4.0.9
-langchain==0.1.4
-langchain-community==0.0.16
 psycopg2-binary==2.9.9
 pymysql==1.1.0
 cryptography==42.0.0
 python-dotenv==1.0.0
-ollama==0.1.6
+groq>=0.9.0

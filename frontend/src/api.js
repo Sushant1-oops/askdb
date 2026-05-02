@@ -1,18 +1,46 @@
 const API = 'http://localhost:8000/api';
 
-async function request(url, options = {}) {
-  const res = await fetch(`${API}${url}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || 'Request failed');
+/**
+ * Make an API request with timeout and error handling.
+ * @param {string} url - API path
+ * @param {object} options - fetch options
+ * @param {number} timeoutMs - timeout in milliseconds (default 120s for LLM queries)
+ */
+async function request(url, options = {}, timeoutMs = 120000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(`${API}${url}`, {
+      headers: { 'Content-Type': 'application/json', ...options.headers },
+      signal: controller.signal,
+      ...options,
+    });
+
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      let errBody;
+      try {
+        errBody = await res.json();
+      } catch {
+        errBody = { detail: res.statusText };
+      }
+      const msg = errBody.detail || errBody.message || `HTTP ${res.status}: ${res.statusText}`;
+      throw new Error(msg);
+    }
+
+    return res;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      throw new Error('Request timed out — the server took too long to respond. Try a simpler query.');
+    }
+    throw err;
   }
-  return res;
 }
 
-const json = (url, opts) => request(url, opts).then(r => r.json());
+const json = (url, opts, timeout) => request(url, opts, timeout).then(r => r.json());
 
 // Database
 export const connectDB = (data) => json('/database/connect', { method: 'POST', body: JSON.stringify(data) });
@@ -24,9 +52,11 @@ export const getTableSchema = (id, table) => json(`/database/connections/${id}/t
 export const getTableData = (id, table, limit = 100) => json(`/database/connections/${id}/tables/${table}/data?limit=${limit}`);
 export const getDatabaseSchema = (id) => json(`/database/connections/${id}/schema`);
 
-// Query
-export const queryNL = (connectionId, question) => json('/query/natural-language', { method: 'POST', body: JSON.stringify({ connection_id: connectionId, question }) });
-export const querySQL = (connectionId, sql_query) => json('/query/sql', { method: 'POST', body: JSON.stringify({ connection_id: connectionId, sql_query }) });
+// Query — longer timeout (120s) for LLM-generated queries
+export const queryNL = (connectionId, question) =>
+  json('/query/natural-language', { method: 'POST', body: JSON.stringify({ connection_id: connectionId, question }) }, 120000);
+export const querySQL = (connectionId, sql_query) =>
+  json('/query/sql', { method: 'POST', body: JSON.stringify({ connection_id: connectionId, sql_query }) }, 30000);
 export const modelStatus = () => json('/query/model-status');
 
 // Export

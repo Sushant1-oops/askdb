@@ -1,10 +1,21 @@
 import { useState, useRef } from 'react';
-import { Send, Sparkles, Code2, AlertCircle, CheckCircle2, Clock, Database } from 'lucide-react';
+import { Send, Sparkles, Code2, AlertCircle, CheckCircle2, Clock, Database, Cpu, RotateCcw, Lightbulb } from 'lucide-react';
 import { useConnection } from '../context/ConnectionContext';
 import { queryNL, querySQL, exportQuery } from '../api';
 import SQLBlock from '../components/SQLBlock';
 import ResultTable from '../components/ResultTable';
 import toast from 'react-hot-toast';
+
+const EXAMPLE_QUERIES = [
+  "Show me all customers from New York",
+  "What are the top 5 most expensive products?",
+  "How many orders were placed last month?",
+  "Which customers have spent more than $500 total?",
+  "Show the average order value by customer city",
+  "List products that have never been ordered",
+  "Show monthly revenue trends",
+  "Which product categories generate the most revenue?",
+];
 
 export default function QueryPage() {
   const { activeConnection } = useConnection();
@@ -28,14 +39,21 @@ export default function QueryPage() {
         setResults(prev => [{
           id: Date.now(), type: 'nl', question: input.trim(),
           sql: data.generated_sql,
-          result: data.query_result, time: elapsed,
+          result: data.query_result,
+          model: data.model_used,
+          retries: data.retries,
+          serverTime: data.execution_time,
+          dbType: data.db_type,
+          time: elapsed,
         }, ...prev]);
       } else {
         data = await querySQL(activeConnection.connection_id, input.trim());
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
         setResults(prev => [{
           id: Date.now(), type: 'sql', sql: input.trim(),
-          result: data.result, time: elapsed,
+          result: data.result,
+          serverTime: data.execution_time,
+          time: elapsed,
         }, ...prev]);
       }
       setInput('');
@@ -68,6 +86,12 @@ export default function QueryPage() {
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(); }
+  };
+
+  const handleExampleClick = (q) => {
+    setInput(q);
+    setMode('natural');
+    inputRef.current?.focus();
   };
 
   if (!activeConnection) {
@@ -128,7 +152,7 @@ export default function QueryPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12,
             color: 'var(--accent)', fontSize: 14 }}>
             <div className="pulse-dot"><span /><span /><span /></div>
-            {mode === 'natural' ? 'AI is generating SQL...' : 'Executing query...'}
+            {mode === 'natural' ? '🤖 AI is generating SQL with Groq (Llama 3.3 70B)...' : 'Executing query...'}
           </div>
         )}
       </div>
@@ -151,6 +175,30 @@ export default function QueryPage() {
 
             {/* Generated SQL */}
             {r.sql && <SQLBlock sql={r.sql} label={r.type === 'nl' ? 'Generated SQL' : 'Executed SQL'} />}
+
+            {/* Model & retry info (NL mode) */}
+            {r.type === 'nl' && r.model && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, fontSize: 12 }}>
+                <span className="badge badge-info" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <Cpu size={11} /> {r.model}
+                </span>
+                {r.dbType && (
+                  <span className="badge badge-info">
+                    {r.dbType.toUpperCase()} dialect
+                  </span>
+                )}
+                {r.retries > 0 && (
+                  <span className="badge badge-warning" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <RotateCcw size={11} /> {r.retries} self-correction{r.retries > 1 ? 's' : ''}
+                  </span>
+                )}
+                {r.serverTime && (
+                  <span className="badge badge-info">
+                    Server: {r.serverTime}s
+                  </span>
+                )}
+              </div>
+            )}
 
             {/* Error */}
             {r.error && (
@@ -217,10 +265,30 @@ export default function QueryPage() {
       </div>
 
       {results.length === 0 && !loading && (
-        <div className="empty-state">
-          <Sparkles size={64} />
-          <h3>Ready to Query</h3>
-          <p>Type a question above or switch to SQL mode to execute queries directly.</p>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 24, marginTop: 32 }}>
+          <div className="empty-state" style={{ marginBottom: 0 }}>
+            <Sparkles size={64} />
+            <h3>Ready to Query</h3>
+            <p>Type a question above or try one of the examples below.</p>
+          </div>
+          {mode === 'natural' && (
+            <div style={{ width: '100%', maxWidth: 700 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12,
+                fontSize: 13, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase',
+                letterSpacing: '0.5px' }}>
+                <Lightbulb size={14} /> Example Queries
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {EXAMPLE_QUERIES.map((q, i) => (
+                  <button key={i} className="btn btn-ghost btn-sm"
+                    style={{ fontSize: 13, textAlign: 'left' }}
+                    onClick={() => handleExampleClick(q)}>
+                    "{q}"
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </>
