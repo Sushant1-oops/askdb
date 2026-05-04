@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Dict
 from services.database_service import db_service
 from services.llm_service import llm_service
 import logging
@@ -20,6 +20,15 @@ class QueryRequest(BaseModel):
 class DirectSQLRequest(BaseModel):
     connection_id: str = Field(..., description="Connection ID")
     sql_query: str = Field(..., description="SQL query to execute")
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., description="Message role: 'user' or 'assistant'")
+    content: str = Field(..., description="Message content")
+
+class ChatRequest(BaseModel):
+    connection_id: str = Field(..., description="Connection ID")
+    message: str = Field(..., description="User's chat message")
+    history: Optional[List[ChatMessage]] = Field(default=None, description="Previous chat messages")
 
 
 @router.post("/natural-language")
@@ -167,3 +176,109 @@ async def check_model_status():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+
+@router.post("/chat")
+async def chat_analyst(request: ChatRequest):
+    """AI Analyst chat endpoint — generates SQL, executes, and provides business insights.
+
+    Pipeline:
+      1. Validate database connection
+      2. Generate SQL from the user's message (reuses existing generate_sql)
+      3. Execute SQL with self-correction loop
+      4. Pass results to the insight generator for analysis + chart config
+      5. Return structured response with answer, chart, SQL, and raw data
+    """
+    start_time = time.time()
+
+    try:
+        # Validate connection
+        if not db_service.test_connection(request.connection_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Database connection is no longer active. Please reconnect."
+            )
+
+        schema = db_service.get_rich_schema(request.connection_id)
+        db_type = db_service.get_db_type(request.connection_id)
+
+        history_dicts = None
+        if request.history:
+            history_dicts = [{"role": h.role, "content": h.content} for h in request.history]
+
+        logger.info(f"Chat Analyst: message='{request.message}', db_type={db_type}")
+
+        # Step 1: Generate SQL
+        generated_sql = None
+        query_result = None
+        model_used = "unknown"
+        retries = 0
+
+        sql_result = llm_service.generate_sql(request.message, schema, db_type)
+
+        if sql_result["success"]:
+            generated_sql = sql_result["sql_query"]
+            model_used = sql_result.get("model_used", "unknown")
+
+            # Step 2: Execute with self-correction
+            query_result = db_service.execute_query(request.connection_id, generated_sql)
+
+            while not query_result["success"] and retries < MAX_CORRECTION_RETRIES:
+                retries += 1
+                error_msg = query_result.get("error", "Unknown execution error")
+                logger.info(
+                    f"Chat self-correction {retries}/{MAX_CORRECTION_RETRIES}: {error_msg}"
+                )
+
+                fix_result = llm_service.fix_sql(
+                    original_question=request.message,
+                    bad_sql=generated_sql,
+                    error_msg=error_msg,
+                    schema=schema,
+                    db_type=db_type,
+                )
+
+                if not fix_result["success"]:
+                    break
+
+                generated_sql = fix_result["sql_query"]
+                model_used = fix_result.get("model_used", model_used)
+                query_result = db_service.execute_query(request.connection_id, generated_sql)
+
+        # Step 3: Generate insight from the results
+        insight = llm_service.generate_chat_insight(
+            message=request.message,
+            schema=schema,
+            db_type=db_type,
+            query_result=query_result,
+            generated_sql=generated_sql,
+            history=history_dicts,
+        )
+
+        execution_time = round(time.time() - start_time, 2)
+
+        return {
+            "answer": insight.get("answer", "I couldn't generate an analysis for this query."),
+            "chart": insight.get("chart"),
+            "generated_sql": generated_sql,
+            "query_result": query_result,
+            "model_used": insight.get("model_used", model_used),
+            "retries": retries,
+            "execution_time": execution_time,
+            "db_type": db_type,
+        }
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error in chat analyst")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Chat analysis failed: {str(e)}"
+        )
+

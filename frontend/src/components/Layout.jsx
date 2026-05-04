@@ -1,10 +1,11 @@
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
-import { LayoutDashboard, MessageSquare, Database, Table2, Workflow, Zap } from 'lucide-react';
+import { LayoutDashboard, MessageSquare, Database, Table2, Workflow, Zap, TrendingUp } from 'lucide-react';
 import { useConnection } from '../context/ConnectionContext';
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/query', icon: MessageSquare, label: 'AI Query' },
+  { to: '/chat', icon: TrendingUp, label: 'AI Analyst' },
   { to: '/schema', icon: Workflow, label: 'Schema Explorer' },
   { to: '/tables', icon: Table2, label: 'Table Viewer' },
   { to: '/connections', icon: Database, label: 'Connections' },

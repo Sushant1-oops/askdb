@@ -1,4 +1,4 @@
-const API = 'http://localhost:8000/api';
+const API = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
 
 /**
  * Make an API request with timeout and error handling.
@@ -57,6 +57,8 @@ export const queryNL = (connectionId, question) =>
   json('/query/natural-language', { method: 'POST', body: JSON.stringify({ connection_id: connectionId, question }) }, 120000);
 export const querySQL = (connectionId, sql_query) =>
   json('/query/sql', { method: 'POST', body: JSON.stringify({ connection_id: connectionId, sql_query }) }, 30000);
+export const queryChat = (connectionId, message, history = []) =>
+  json('/query/chat', { method: 'POST', body: JSON.stringify({ connection_id: connectionId, message, history }) }, 180000);
 export const modelStatus = () => json('/query/model-status');
 
 // Export
