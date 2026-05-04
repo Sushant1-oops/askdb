@@ -50,6 +50,8 @@ class DatabaseService:
                 conn_string = f"sqlite:///{file_path if file_path else database}"
             elif db_type == "postgresql":
                 conn_string = f"postgresql://{username}:{password}@{host}:{port or 5432}/{database}"
+                if host and "neon.tech" in host:
+                    conn_string += "?sslmode=require"
             elif db_type == "mysql":
                 conn_string = f"mysql+pymysql://{username}:{password}@{host}:{port or 3306}/{database}"
             else:
