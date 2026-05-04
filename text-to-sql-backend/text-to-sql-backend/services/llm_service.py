@@ -300,9 +300,9 @@ class LLMQueryService:
 CRITICAL OUTPUT RULES:
 1. Output ONLY the raw SQL query — NO explanations, NO markdown, NO comments, NO code fences.
 2. Do NOT wrap the query in ```sql``` or any other formatting.
-3. Use the EXACT table and column names from the provided schema.
-4. Use proper JOINs when the question involves multiple tables.
-5. End the query with a semicolon.
+3. Use the EXACT table and column names from the provided schema. 
+4. IF THE REQUESTED DATA DOES NOT EXIST IN THE SCHEMA: Do not hallucinate tables or write CREATE statements. Instead, output exactly: SELECT 'Requested data not found in schema' AS error;
+5. Output EXACTLY ONE single SQL statement. NEVER output multiple statements separated by semicolons.
 6. If the question is ambiguous, make a reasonable assumption and generate the best possible query.
 
 ADVANCED SQL CAPABILITIES (use when appropriate):
@@ -315,7 +315,7 @@ ADVANCED SQL CAPABILITIES (use when appropriate):
 - UNION / INTERSECT / EXCEPT for combining result sets
 - COALESCE / NULLIF for null handling
 
-Remember: Output ONLY the SQL query. Nothing else."""
+Remember: Output ONLY the SQL query. Nothing else. No conversational text."""
 
     def _build_user_prompt(self, question: str, schema: Dict[str, Any]) -> str:
         """Build the user prompt with schema and question."""
@@ -420,7 +420,7 @@ RULES:
 1. Output ONLY the corrected SQL query — NO explanations, NO markdown, NO code fences.
 2. Carefully analyze the error message to understand what went wrong.
 3. Use the exact table and column names from the schema.
-4. End the query with a semicolon.
+4. Output EXACTLY ONE single SQL statement. NEVER output multiple statements separated by semicolons.
 5. Common fixes: wrong column names, missing quotes, wrong JOIN syntax, dialect-specific issues."""
 
         ddl = self._build_ddl_schema(schema)
