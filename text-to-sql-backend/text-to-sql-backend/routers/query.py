@@ -1,284 +1,113 @@
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
-from services.database_service import db_service
-from services.llm_service import llm_service
-import logging
 import time
+from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field
+
+from config import settings
+from services.container import db_service, executor, history_store, llm_client, pipeline
 
 router = APIRouter()
 
-MAX_CORRECTION_RETRIES = 3  # Increased from 2 for better accuracy
-
-# Request Models
-class QueryRequest(BaseModel):
-    connection_id: str = Field(..., description="Connection ID")
-    question: str = Field(..., description="Natural language query")
-
-class DirectSQLRequest(BaseModel):
-    connection_id: str = Field(..., description="Connection ID")
-    sql_query: str = Field(..., description="SQL query to execute")
 
 class ChatMessage(BaseModel):
-    role: str = Field(..., description="Message role: 'user' or 'assistant'")
-    content: str = Field(..., description="Message content")
+    role: str = Field(..., description="'user' or 'assistant'")
+    content: str = ""
+    sql: Optional[str] = Field(None, description="SQL the assistant produced for this turn")
 
-class ChatRequest(BaseModel):
-    connection_id: str = Field(..., description="Connection ID")
-    message: str = Field(..., description="User's chat message")
-    history: Optional[List[ChatMessage]] = Field(default=None, description="Previous chat messages")
+
+class AskRequest(BaseModel):
+    connection_id: str
+    question: str = Field(..., min_length=1, max_length=5000)
+    history: Optional[List[ChatMessage]] = None
+    judge: Optional[bool] = Field(None, description="Override the server default for LLM-as-judge")
+
+
+class SQLRequest(BaseModel):
+    connection_id: str
+    sql_query: str = Field(..., min_length=1, max_length=50_000)
+
+
+def _history(body: AskRequest) -> Optional[List[Dict[str, Any]]]:
+    return [m.model_dump() for m in body.history][-8:] if body.history else None
 
 
 @router.post("/natural-language")
-async def query_natural_language(request: QueryRequest):
-    """Convert natural language to SQL and execute with self-correction.
-
-    Pipeline:
-      1. Fetch rich schema (DDL, sample data, foreign keys)
-      2. Generate SQL via Groq LLM (dialect-aware)
-      3. Execute the SQL
-      4. If execution fails, self-correct up to MAX_CORRECTION_RETRIES times
-      5. Return results with metadata
-    """
-    start_time = time.time()
-
-    try:
-        # Validate connection exists and is alive
-        if not db_service.test_connection(request.connection_id):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Database connection is no longer active. Please reconnect."
-            )
-
-        # Get rich schema (DDL + sample data + foreign keys)
-        schema = db_service.get_rich_schema(request.connection_id)
-        db_type = db_service.get_db_type(request.connection_id)
-
-        logger.info(
-            f"NL Query: question='{request.question}', "
-            f"db_type={db_type}, tables={list(schema.get('tables', {}).keys())}"
-        )
-
-        # Generate SQL from natural language
-        sql_result = llm_service.generate_sql(request.question, schema, db_type)
-
-        if not sql_result["success"]:
-            return {
-                "question": request.question,
-                "generated_sql": None,
-                "query_result": {
-                    "success": False,
-                    "error": f"SQL generation failed: {sql_result.get('error', 'Unknown error')}",
-                },
-                "model_used": sql_result.get("model_used", "unknown"),
-                "retries": 0,
-                "execution_time": round(time.time() - start_time, 2),
-            }
-
-        generated_sql = sql_result["sql_query"]
-        model_used = sql_result.get("model_used", "unknown")
-        retries = 0
-
-        # Execute and self-correct loop
-        query_result = db_service.execute_query(request.connection_id, generated_sql)
-
-        while not query_result["success"] and retries < MAX_CORRECTION_RETRIES:
-            retries += 1
-            error_msg = query_result.get("error", "Unknown execution error")
-            logger.info(
-                f"Self-correction attempt {retries}/{MAX_CORRECTION_RETRIES} "
-                f"for question='{request.question}' error='{error_msg}'"
-            )
-
-            fix_result = llm_service.fix_sql(
-                original_question=request.question,
-                bad_sql=generated_sql,
-                error_msg=error_msg,
-                schema=schema,
-                db_type=db_type,
-            )
-
-            if not fix_result["success"]:
-                logger.warning(f"Self-correction attempt {retries} failed: {fix_result.get('error')}")
-                break
-
-            generated_sql = fix_result["sql_query"]
-            model_used = fix_result.get("model_used", model_used)
-            query_result = db_service.execute_query(request.connection_id, generated_sql)
-
-        execution_time = round(time.time() - start_time, 2)
-
-        return {
-            "question": request.question,
-            "generated_sql": generated_sql,
-            "query_result": query_result,
-            "model_used": model_used,
-            "retries": retries,
-            "execution_time": execution_time,
-            "db_type": db_type,
-        }
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error in natural-language query")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Query processing failed: {str(e)}"
-        )
-
-
-@router.post("/sql")
-async def execute_sql(request: DirectSQLRequest):
-    """Execute a direct SQL query."""
-    start_time = time.time()
-    try:
-        # Validate connection
-        if not db_service.test_connection(request.connection_id):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Database connection is no longer active. Please reconnect."
-            )
-
-        result = db_service.execute_query(request.connection_id, request.sql_query)
-        return {
-            "sql_query": request.sql_query,
-            "result": result,
-            "execution_time": round(time.time() - start_time, 2),
-        }
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Query execution failed: {str(e)}"
-        )
-
-
-@router.get("/model-status")
-async def check_model_status():
-    """Check if LLM model is available."""
-    try:
-        model_status = llm_service.check_model_availability()
-        return model_status
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+def natural_language(body: AskRequest) -> Dict[str, Any]:
+    """Question -> guarded, verified SQL + result (used by the SQL editor's AI bar)."""
+    db_service.get_connection_info(body.connection_id)  
+    return pipeline.run(body.connection_id, body.question, history=_history(body), judge=body.judge, summarize=False)
 
 
 @router.post("/chat")
-async def chat_analyst(request: ChatRequest):
-    """AI Analyst chat endpoint — generates SQL, executes, and provides business insights.
+def chat(body: AskRequest) -> Dict[str, Any]:
+    """Ask AI: same pipeline plus a plain-language answer, chart spec and follow-ups."""
+    db_service.get_connection_info(body.connection_id)
+    return pipeline.run(body.connection_id, body.question, history=_history(body), judge=body.judge, summarize=True)
 
-    Pipeline:
-      1. Validate database connection
-      2. Generate SQL from the user's message (reuses existing generate_sql)
-      3. Execute SQL with self-correction loop
-      4. Pass results to the insight generator for analysis + chart config
-      5. Return structured response with answer, chart, SQL, and raw data
-    """
-    start_time = time.time()
 
-    try:
-        # Validate connection
-        if not db_service.test_connection(request.connection_id):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Database connection is no longer active. Please reconnect."
-            )
+@router.post("/sql")
+def execute_sql(body: SQLRequest) -> Dict[str, Any]:
+    """Run hand-written SQL. Read-only, single statement, row-capped, redacted."""
+    db_service.get_connection_info(body.connection_id)
+    started = time.perf_counter()
+    outcome = executor.execute(body.connection_id, body.sql_query)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
 
-        schema = db_service.get_rich_schema(request.connection_id)
-        db_type = db_service.get_db_type(request.connection_id)
+    if outcome.ok:
+        state, message = "success", ""
+    elif outcome.kind == "guard":
+        security = bool(outcome.guard and outcome.guard.has_security_violation)
+        state, message = ("blocked" if security else "failed"), outcome.message
+    else:
+        state, message = "failed", outcome.message
 
-        history_dicts = None
-        if request.history:
-            history_dicts = [{"role": h.role, "content": h.content} for h in request.history]
+    result = outcome.result
+    history_store.add(
+        body.connection_id, source="editor", sql=outcome.sql or body.sql_query, status=state,
+        row_count=result["row_count"] if result else None, duration_ms=elapsed_ms,
+    )
+    return {
+        "status": state,
+        "message": message,
+        "sql": outcome.sql or body.sql_query,
+        "result": result,
+        "guardrails": outcome.guard.to_dict() if outcome.guard else None,
+        "execution_time": round(elapsed_ms / 1000, 2),
+    }
 
-        logger.info(f"Chat Analyst: message='{request.message}', db_type={db_type}")
 
-        # Step 1: Generate SQL
-        generated_sql = None
-        query_result = None
-        model_used = "unknown"
-        retries = 0
+@router.get("/history")
+def get_history(connection_id: str, limit: int = Query(30, ge=1, le=200)) -> Dict[str, Any]:
+    db_service.get_connection_info(connection_id)
+    return {"items": history_store.list(connection_id, limit)}
 
-        sql_result = llm_service.generate_sql(request.message, schema, db_type)
 
-        if sql_result["success"]:
-            generated_sql = sql_result["sql_query"]
-            model_used = sql_result.get("model_used", "unknown")
+@router.delete("/history")
+def clear_history(connection_id: str) -> Dict[str, str]:
+    db_service.get_connection_info(connection_id)
+    history_store.clear(connection_id)
+    return {"status": "cleared"}
 
-            # Step 2: Execute with self-correction
-            query_result = db_service.execute_query(request.connection_id, generated_sql)
 
-            while not query_result["success"] and retries < MAX_CORRECTION_RETRIES:
-                retries += 1
-                error_msg = query_result.get("error", "Unknown execution error")
-                logger.info(
-                    f"Chat self-correction {retries}/{MAX_CORRECTION_RETRIES}: {error_msg}"
-                )
-
-                fix_result = llm_service.fix_sql(
-                    original_question=request.message,
-                    bad_sql=generated_sql,
-                    error_msg=error_msg,
-                    schema=schema,
-                    db_type=db_type,
-                )
-
-                if not fix_result["success"]:
-                    break
-
-                generated_sql = fix_result["sql_query"]
-                model_used = fix_result.get("model_used", model_used)
-                query_result = db_service.execute_query(request.connection_id, generated_sql)
-
-        # Step 3: Generate insight from the results
-        insight = llm_service.generate_chat_insight(
-            message=request.message,
-            schema=schema,
-            db_type=db_type,
-            query_result=query_result,
-            generated_sql=generated_sql,
-            history=history_dicts,
-        )
-
-        execution_time = round(time.time() - start_time, 2)
-
-        return {
-            "answer": insight.get("answer", "I couldn't generate an analysis for this query."),
-            "chart": insight.get("chart"),
-            "generated_sql": generated_sql,
-            "query_result": query_result,
-            "model_used": insight.get("model_used", model_used),
-            "retries": retries,
-            "execution_time": execution_time,
-            "db_type": db_type,
-        }
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error in chat analyst")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Chat analysis failed: {str(e)}"
-        )
-
+@router.get("/model-status")
+def model_status(deep: bool = Query(False, description="Also ask the provider which models exist")) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "configured": llm_client.configured,
+        "provider": "Groq",
+        "model_chain": settings.model_chain,
+        "judge_model_chain": settings.judge_model_chain,
+        "judge_enabled": settings.judge_enabled,
+        "limits": {
+            "max_rows": settings.max_rows,
+            "query_timeout_seconds": settings.query_timeout_seconds,
+            "max_repair_attempts": settings.max_repair_attempts,
+        },
+    }
+    if deep and llm_client.configured:
+        try:
+            available = set(llm_client.available_models())
+            body["chain_status"] = {m: m in available for m in {*settings.model_chain, *settings.judge_model_chain}}
+        except Exception as exc:
+            body["error"] = str(exc)[:200]
+    return body

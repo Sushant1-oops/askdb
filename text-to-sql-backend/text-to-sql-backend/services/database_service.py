@@ -1,426 +1,345 @@
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import Engine
-from typing import Dict, List, Any, Optional
-import uuid
-from datetime import datetime
+"""Connection management and schema introspection (SQLAlchemy).
+
+Security posture for every connection:
+  * the *session* is read-only (Postgres/MySQL session characteristics, SQLite
+    ``query_only``), so even a guard bypass cannot write;
+  * a statement timeout is set (Postgres/MySQL server side, SQLite progress handler);
+  * SQL is executed through raw DBAPI cursors, see ``sql_runtime``;
+  * passwords are used to build the engine and never stored or returned.
+"""
+
+from __future__ import annotations
+
 import logging
+import os
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import create_engine, event, inspect
+from sqlalchemy.engine import URL, Engine
+
+from config import Settings
+from services.errors import BadRequestError, NotFoundError, QueryExecutionError
+from services.guardrails import redact_rows
+from services.schema import ColumnInfo, ForeignKey, SchemaContext, TableInfo
+from services.schema_profiler import enrich_schema
+from services.sql_runtime import RawResult, clean_db_error, configure_sqlite, quote_identifier, run_select
 
 logger = logging.getLogger(__name__)
 
+SUPPORTED_TYPES = ("sqlite", "postgresql", "mysql")
+MAX_CONNECTIONS = 20
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+class _Entry:
+    def __init__(self, **kw: Any) -> None:
+        self.id: str = kw["id"]
+        self.db_type: str = kw["db_type"]
+        self.database: str = kw["database"]
+        self.label: str = kw["label"]
+        self.host: Optional[str] = kw.get("host")
+        self.port: Optional[int] = kw.get("port")
+        self.username: Optional[str] = kw.get("username")
+        self.engine: Engine = kw["engine"]
+        self.created_at: str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def public(self) -> Dict[str, Any]:
+        return {
+            "connection_id": self.id,
+            "db_type": self.db_type,
+            "database": self.database,
+            "label": self.label,
+            "host": self.host,
+            "port": self.port,
+            "username": self.username,
+            "created_at": self.created_at,
+            "status": "connected",
+        }
+
 
 class DatabaseService:
-    """Service for managing database connections and operations.
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._entries: Dict[str, _Entry] = {}
+        self._schemas: Dict[str, SchemaContext] = {}
+        self._schema_locks: Dict[str, threading.Lock] = {}
+        self._lock = threading.RLock()
 
-    Supports SQLite, PostgreSQL, and MySQL with proper identifier quoting
-    and connection health checking.
-    """
+    
+    def create_connection(
+        self,
+        db_type: str,
+        database: str,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        file_path: Optional[str] = None,
+        ssl: bool = False,
+    ) -> Dict[str, Any]:
+        db_type = (db_type or "").strip().lower()
+        if db_type in ("postgres", "pg"):
+            db_type = "postgresql"
+        if db_type not in SUPPORTED_TYPES:
+            raise BadRequestError(f"Unsupported database type '{db_type}'. Use one of: {', '.join(SUPPORTED_TYPES)}.")
+        with self._lock:
+            if len(self._entries) >= MAX_CONNECTIONS:
+                raise BadRequestError(f"Connection limit reached ({MAX_CONNECTIONS}). Disconnect one first.")
 
-    def __init__(self):
-        self.connections: Dict[str, Dict[str, Any]] = {}
+        if db_type == "sqlite":
+            path = self._validate_sqlite_path(file_path or database)
+            label = os.path.basename(path)
+            engine = self._build_engine(db_type, URL.create("sqlite", database=path))
+            database, host, port, username = label, None, None, None
+        else:
+            if not host or not username:
+                raise BadRequestError("Host and username are required.")
+            if not database:
+                raise BadRequestError("Database name is required.")
+            default_port = 5432 if db_type == "postgresql" else 3306
+            query = {"sslmode": "require"} if db_type == "postgresql" and (ssl or "neon.tech" in host) else {}
+            url = URL.create(
+                "postgresql+psycopg2" if db_type == "postgresql" else "mysql+pymysql",
+                username=username, password=password or None, host=host, port=port or default_port,
+                database=database, query=query,
+            )
+            engine = self._build_engine(db_type, url)
+            label = f"{database}@{host}"
 
-    # ------------------------------------------------------------------
-    # Identifier quoting — dialect-aware
-    # ------------------------------------------------------------------
+        try:
+            with engine.connect() as conn:
+                run_select(conn.connection, "SELECT 1", 1, 10)
+        except Exception as exc:
+            engine.dispose()
+            logger.warning("connection test failed for %s: %s", db_type, type(exc).__name__)
+            raise BadRequestError(f"Could not connect: {clean_db_error(exc)}") from exc
+
+        entry = _Entry(id=str(uuid.uuid4()), db_type=db_type, database=database, label=label,
+                       host=host, port=port, username=username, engine=engine)
+        with self._lock:
+            self._entries[entry.id] = entry
+        try:  
+            self.get_schema(entry.id)
+        except Exception:  
+            logger.exception("schema warm-up failed")
+        return entry.public()
 
     @staticmethod
-    def _quote_identifier(name: str, db_type: str = "sqlite") -> str:
-        """Quote a table or column name for safe use in SQL.
-
-        SQLite & PostgreSQL use double quotes, MySQL uses backticks.
-        """
-        if db_type == "mysql":
-            return f"`{name}`"
-        return f'"{name}"'
-
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
-
-    def create_connection(self, db_type: str, database: str,
-                         host: Optional[str] = None, port: Optional[int] = None,
-                         username: Optional[str] = None, password: Optional[str] = None,
-                         file_path: Optional[str] = None) -> Dict[str, Any]:
-        """Create a new database connection."""
-        try:
-            # Generate connection ID
-            connection_id = str(uuid.uuid4())
-
-            # Build connection string
-            if db_type == "sqlite":
-                conn_string = f"sqlite:///{file_path if file_path else database}"
-            elif db_type == "postgresql":
-                conn_string = f"postgresql://{username}:{password}@{host}:{port or 5432}/{database}"
-                if host and "neon.tech" in host:
-                    conn_string += "?sslmode=require"
-            elif db_type == "mysql":
-                conn_string = f"mysql+pymysql://{username}:{password}@{host}:{port or 3306}/{database}"
-            else:
-                raise ValueError(f"Unsupported database type: {db_type}")
-
-            # Create engine with connection pooling
-            engine = create_engine(
-                conn_string,
-                pool_pre_ping=True,
-                pool_recycle=3600,
-                echo=False,
+    def _validate_sqlite_path(raw_path: str) -> str:
+        path = os.path.abspath(os.path.expanduser((raw_path or "").strip()))
+        if not raw_path or not os.path.isfile(path):
+            raise BadRequestError(
+                f"SQLite file not found: {path}. Provide the full path to an existing .db/.sqlite file "
+                "(relative paths are resolved from the backend's working directory)."
             )
+        with open(path, "rb") as fh:
+            if fh.read(16) != _SQLITE_MAGIC:
+                raise BadRequestError("That file is not a SQLite database.")
+        return path
 
-            # Test connection
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
+    def _build_engine(self, db_type: str, url: URL) -> Engine:
+        timeout = self.settings.query_timeout_seconds
+        kwargs: Dict[str, Any] = {"pool_pre_ping": True}
+        if db_type == "sqlite":
+            kwargs["connect_args"] = {"check_same_thread": False}
+        else:
+            kwargs.update(pool_size=5, max_overflow=5, pool_recycle=1800)
+            kwargs["connect_args"] = {"connect_timeout": 10}
+            if db_type == "mysql":
+                kwargs["connect_args"]["read_timeout"] = timeout + 10
+        engine = create_engine(url, **kwargs)
 
-            # Store connection
-            self.connections[connection_id] = {
-                "id": connection_id,
-                "db_type": db_type,
-                "database": database,
-                "engine": engine,
-                "created_at": datetime.utcnow().isoformat(),
-                "host": host,
-                "port": port,
-            }
+        
+        
+        @event.listens_for(engine, "connect")
+        def _on_connect(dbapi_conn: Any, _record: Any) -> None:
+            if db_type == "sqlite":
+                configure_sqlite(dbapi_conn)
+            elif db_type == "postgresql":
+                cur = dbapi_conn.cursor()
+                cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                cur.execute(f"SET statement_timeout = {int(timeout * 1000)}")
+                cur.close()
+                dbapi_conn.commit()
+            elif db_type == "mysql":
+                cur = dbapi_conn.cursor()
+                for stmt in (
+                    "SET SESSION TRANSACTION READ ONLY",
+                    f"SET SESSION MAX_EXECUTION_TIME = {int(timeout * 1000)}",  
+                ):
+                    try:
+                        cur.execute(stmt)
+                    except Exception:
+                        logger.info("mysql session option not supported: %s", stmt)
+                cur.close()
+                dbapi_conn.commit()
 
-            return {
-                "connection_id": connection_id,
-                "db_type": db_type,
-                "database": database,
-                "status": "connected",
-            }
+        return engine
 
-        except Exception as e:
-            logger.error(f"Connection failed: {e}")
-            raise Exception(f"Failed to connect to database: {str(e)}")
+    def _entry(self, connection_id: str) -> _Entry:
+        with self._lock:
+            entry = self._entries.get(connection_id)
+        if entry is None:
+            raise NotFoundError("Connection not found. It may have been closed or the server restarted.")
+        return entry
 
     def get_engine(self, connection_id: str) -> Engine:
-        """Get SQLAlchemy engine for a connection."""
-        if connection_id not in self.connections:
-            raise ValueError(f"Connection {connection_id} not found")
-        return self.connections[connection_id]["engine"]
+        return self._entry(connection_id).engine
 
     def get_db_type(self, connection_id: str) -> str:
-        """Get the database type for a connection."""
-        if connection_id not in self.connections:
-            raise ValueError(f"Connection {connection_id} not found")
-        return self.connections[connection_id]["db_type"]
+        return self._entry(connection_id).db_type
 
     def get_connection_info(self, connection_id: str) -> Dict[str, Any]:
-        """Get connection information."""
-        if connection_id not in self.connections:
-            raise ValueError(f"Connection {connection_id} not found")
-
-        conn_info = self.connections[connection_id].copy()
-        conn_info.pop("engine", None)  # Remove engine object
-        return conn_info
-
-    def test_connection(self, connection_id: str) -> bool:
-        """Test if a connection is still alive."""
-        try:
-            engine = self.get_engine(connection_id)
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            return True
-        except Exception:
-            return False
-
-    def list_tables(self, connection_id: str) -> List[str]:
-        """List all tables in the database."""
-        engine = self.get_engine(connection_id)
-        inspector = inspect(engine)
-        return inspector.get_table_names()
-
-    def get_table_schema(self, connection_id: str, table_name: str) -> Dict[str, Any]:
-        """Get detailed schema for a table."""
-        engine = self.get_engine(connection_id)
-        inspector = inspect(engine)
-
-        columns = inspector.get_columns(table_name)
-        primary_keys = inspector.get_pk_constraint(table_name)
-        foreign_keys = inspector.get_foreign_keys(table_name)
-        indexes = inspector.get_indexes(table_name)
-
-        return {
-            "table_name": table_name,
-            "columns": columns,
-            "primary_keys": primary_keys,
-            "foreign_keys": foreign_keys,
-            "indexes": indexes,
-        }
-
-    def get_database_schema(self, connection_id: str) -> Dict[str, Any]:
-        """Get complete database schema."""
-        engine = self.get_engine(connection_id)
-        inspector = inspect(engine)
-        tables = inspector.get_table_names()
-
-        schema = {
-            "database": self.connections[connection_id]["database"],
-            "tables": {},
-        }
-
-        for table in tables:
-            columns = inspector.get_columns(table)
-            pk_constraint = inspector.get_pk_constraint(table)
-            pk_cols = set(pk_constraint.get("constrained_columns", []))
-
-            schema["tables"][table] = {
-                "columns": [
-                    {
-                        "name": col["name"],
-                        "type": str(col["type"]),
-                        "nullable": col.get("nullable", True),
-                        "default": col.get("default"),
-                        "primary_key": col["name"] in pk_cols,
-                    }
-                    for col in columns
-                ]
-            }
-
-        return schema
-
-    # ------------------------------------------------------------------
-    # Rich schema — includes DDL, foreign keys, sample data, row counts
-    # ------------------------------------------------------------------
-
-    def get_rich_schema(self, connection_id: str) -> Dict[str, Any]:
-        """Get a rich schema payload optimised for LLM prompt injection.
-
-        For each table the dict contains:
-          - columns   (list of dicts)
-          - ddl       (CREATE TABLE statement as a string)
-          - foreign_keys (list of FK dicts)
-          - sample_data  (first 3 rows as list of dicts)
-          - row_count    (int)
-        """
-        engine = self.get_engine(connection_id)
-        db_type = self.get_db_type(connection_id)
-        inspector = inspect(engine)
-        tables = inspector.get_table_names()
-
-        schema: Dict[str, Any] = {
-            "database": self.connections[connection_id]["database"],
-            "db_type": db_type,
-            "tables": {},
-        }
-
-        for table in tables:
-            columns = inspector.get_columns(table)
-            foreign_keys = inspector.get_foreign_keys(table)
-            pk_constraint = inspector.get_pk_constraint(table)
-            pk_cols = set(pk_constraint.get("constrained_columns", []))
-
-            # Build column info list
-            col_info = []
-            for c in columns:
-                col_info.append({
-                    "name": c["name"],
-                    "type": str(c["type"]),
-                    "nullable": c.get("nullable", True),
-                    "default": c.get("default"),
-                    "primary_key": c["name"] in pk_cols,
-                })
-
-            # Build DDL
-            ddl = self._build_create_table_ddl(table, col_info, foreign_keys)
-
-            # Sample data (3 rows)
-            sample_data = self._fetch_sample_rows(engine, table, db_type, limit=3)
-
-            # Row count
-            row_count = self._fetch_row_count(engine, table, db_type)
-
-            schema["tables"][table] = {
-                "columns": col_info,
-                "ddl": ddl,
-                "foreign_keys": [
-                    {
-                        "constrained_columns": fk.get("constrained_columns", []),
-                        "referred_table": fk.get("referred_table", ""),
-                        "referred_columns": fk.get("referred_columns", []),
-                    }
-                    for fk in foreign_keys
-                ],
-                "sample_data": sample_data,
-                "row_count": row_count,
-            }
-
-        return schema
-
-    @staticmethod
-    def _build_create_table_ddl(table_name: str,
-                                 columns: List[Dict[str, Any]],
-                                 foreign_keys: List[Dict]) -> str:
-        """Synthesise a CREATE TABLE DDL statement from inspector metadata."""
-        col_lines = []
-        for c in columns:
-            line = f"  {c['name']} {c['type']}"
-            if c.get("primary_key"):
-                line += " PRIMARY KEY"
-            if not c.get("nullable", True):
-                line += " NOT NULL"
-            if c.get("default") is not None:
-                line += f" DEFAULT {c['default']}"
-            col_lines.append(line)
-
-        for fk in foreign_keys:
-            local = ", ".join(fk.get("constrained_columns", []))
-            ref_table = fk.get("referred_table", "")
-            ref_cols = ", ".join(fk.get("referred_columns", []))
-            col_lines.append(f"  FOREIGN KEY ({local}) REFERENCES {ref_table}({ref_cols})")
-
-        return f"CREATE TABLE {table_name} (\n" + ",\n".join(col_lines) + "\n);"
-
-    @staticmethod
-    def _fetch_sample_rows(engine: Engine, table: str,
-                           db_type: str = "sqlite", limit: int = 3) -> List[Dict]:
-        """Return a few sample rows as list-of-dicts with safe identifier quoting."""
-        try:
-            # Quote table name based on dialect
-            if db_type == "mysql":
-                quoted_table = f"`{table}`"
-            else:
-                quoted_table = f'"{table}"'
-
-            with engine.connect() as conn:
-                result = conn.execute(text(f"SELECT * FROM {quoted_table} LIMIT {limit}"))
-                cols = list(result.keys())
-                rows = []
-                for row in result.fetchall():
-                    row_dict = {}
-                    for i, col in enumerate(cols):
-                        val = row[i]
-                        # Convert non-serializable types to string
-                        if isinstance(val, (bytes, bytearray)):
-                            val = val.hex()
-                        elif isinstance(val, datetime):
-                            val = val.isoformat()
-                        row_dict[col] = val
-                    rows.append(row_dict)
-                return rows
-        except Exception as e:
-            logger.warning(f"Could not fetch sample rows for {table}: {e}")
-            return []
-
-    @staticmethod
-    def _fetch_row_count(engine: Engine, table: str,
-                         db_type: str = "sqlite") -> Optional[int]:
-        """Return the total row count for a table."""
-        try:
-            if db_type == "mysql":
-                quoted_table = f"`{table}`"
-            else:
-                quoted_table = f'"{table}"'
-
-            with engine.connect() as conn:
-                result = conn.execute(text(f"SELECT COUNT(*) FROM {quoted_table}"))
-                return result.scalar()
-        except Exception as e:
-            logger.warning(f"Could not fetch row count for {table}: {e}")
-            return None
-
-    # ------------------------------------------------------------------
-    # Query execution
-    # ------------------------------------------------------------------
-
-    def execute_query(self, connection_id: str, query: str) -> Dict[str, Any]:
-        """Execute SQL query and return results.
-
-        Handles SELECT (returns rows), DML (returns affected count),
-        and catches all errors gracefully.
-        """
-        engine = self.get_engine(connection_id)
-
-        # Strip trailing semicolons and whitespace — SQLAlchemy doesn't need them
-        clean_query = query.strip().rstrip(";").strip()
-        if not clean_query:
-            return {"success": False, "error": "Empty query"}
-
-        try:
-            with engine.connect() as conn:
-                result = conn.execute(text(clean_query))
-
-                # Check if query returns results
-                if result.returns_rows:
-                    columns = list(result.keys())
-                    raw_rows = result.fetchall()
-                    rows = []
-                    for row in raw_rows:
-                        row_dict = {}
-                        for i, col in enumerate(columns):
-                            val = row[i]
-                            # Handle non-JSON-serializable types
-                            if isinstance(val, (bytes, bytearray)):
-                                val = val.hex()
-                            elif isinstance(val, datetime):
-                                val = val.isoformat()
-                            elif isinstance(val, set):
-                                val = list(val)
-                            row_dict[col] = val
-                        rows.append(row_dict)
-
-                    return {
-                        "success": True,
-                        "columns": columns,
-                        "rows": rows,
-                        "row_count": len(rows),
-                    }
-                else:
-                    # For INSERT, UPDATE, DELETE
-                    conn.commit()
-                    return {
-                        "success": True,
-                        "message": "Query executed successfully",
-                        "rows_affected": result.rowcount,
-                    }
-
-        except Exception as e:
-            error_msg = str(e)
-            # Extract the core error message from SQLAlchemy wrapper
-            if "OperationalError" in error_msg:
-                match = re.search(r"\) (.+)", error_msg)
-                if match:
-                    error_msg = match.group(1)
-            logger.warning(f"Query execution failed: {error_msg}")
-            return {
-                "success": False,
-                "error": error_msg,
-            }
-
-    def get_table_data(self, connection_id: str, table_name: str,
-                       limit: Optional[int] = 100) -> Dict[str, Any]:
-        """Get data from a table with safe identifier quoting."""
-        db_type = self.get_db_type(connection_id)
-        quoted_table = self._quote_identifier(table_name, db_type)
-        query = f"SELECT * FROM {quoted_table}"
-        if limit:
-            query += f" LIMIT {limit}"
-
-        return self.execute_query(connection_id, query)
-
-    def close_connection(self, connection_id: str) -> Dict[str, str]:
-        """Close a database connection."""
-        if connection_id in self.connections:
-            engine = self.connections[connection_id]["engine"]
-            engine.dispose()
-            del self.connections[connection_id]
-            return {"status": "disconnected", "connection_id": connection_id}
-
-        raise ValueError(f"Connection {connection_id} not found")
+        return self._entry(connection_id).public()
 
     def list_connections(self) -> List[Dict[str, Any]]:
-        """List all active connections."""
-        return [
-            {
-                "connection_id": conn_id,
-                "db_type": conn_data["db_type"],
-                "database": conn_data["database"],
-                "created_at": conn_data["created_at"],
-            }
-            for conn_id, conn_data in self.connections.items()
-        ]
+        with self._lock:
+            return [e.public() for e in self._entries.values()]
 
+    def close_connection(self, connection_id: str) -> Dict[str, str]:
+        entry = self._entry(connection_id)
+        with self._lock:
+            self._entries.pop(connection_id, None)
+            self._schemas.pop(connection_id, None)
+            self._schema_locks.pop(connection_id, None)
+        entry.engine.dispose()
+        return {"status": "disconnected", "connection_id": connection_id}
 
-# Need re for error parsing in execute_query
-import re
+    def ping(self, connection_id: str, samples: int = 3) -> Optional[int]:
+        """Average round-trip latency in ms, or None if the database is unreachable."""
+        engine = self.get_engine(connection_id)
+        times: List[float] = []
+        try:
+            with engine.connect() as conn:
+                for _ in range(samples):
+                    started = time.perf_counter()
+                    run_select(conn.connection, "SELECT 1", 1, 5)
+                    times.append((time.perf_counter() - started) * 1000)
+        except Exception:
+            return None
+        return max(1, round(sum(times) / len(times)))
 
-# Singleton instance
-db_service = DatabaseService()
+    
+    def get_schema(self, connection_id: str, refresh: bool = False) -> SchemaContext:
+        entry = self._entry(connection_id)
+        with self._lock:
+            lock = self._schema_locks.setdefault(connection_id, threading.Lock())
+        with lock:  
+            cached = self._schemas.get(connection_id)
+            fresh = cached is not None and (time.time() - cached.built_at) < self.settings.schema_cache_ttl_seconds
+            if cached is not None and fresh and not refresh:
+                return cached
+            schema = self._introspect(entry)
+            with self._lock:
+                if connection_id in self._entries:
+                    self._schemas[connection_id] = schema
+            return schema
+
+    def _introspect(self, entry: _Entry) -> SchemaContext:
+        started = time.perf_counter()
+        inspector = inspect(entry.engine)
+        schema = SchemaContext(database=entry.database, db_type=entry.db_type)
+        objects = [(n, "table") for n in inspector.get_table_names()]
+        try:
+            objects += [(n, "view") for n in inspector.get_view_names()]
+        except Exception:  
+            logger.info("could not list views for %s", entry.label)
+
+        for name, kind in objects:
+            try:
+                pk_cols = set(inspector.get_pk_constraint(name).get("constrained_columns") or [])
+                columns = []
+                for c in inspector.get_columns(name):
+                    try:
+                        type_name = str(c["type"])
+                    except Exception:
+                        type_name = ""
+                    columns.append(ColumnInfo(
+                        name=c["name"], type=type_name, nullable=bool(c.get("nullable", True)),
+                        primary_key=c["name"] in pk_cols,
+                    ))
+                fks = [
+                    ForeignKey(list(fk.get("constrained_columns") or []), fk.get("referred_table") or "",
+                               list(fk.get("referred_columns") or []))
+                    for fk in (inspector.get_foreign_keys(name) if kind == "table" else [])
+                    if fk.get("referred_table")
+                ]
+                schema.tables[name] = TableInfo(name=name, kind=kind, columns=columns, foreign_keys=fks)
+            except Exception:
+                logger.exception("could not introspect %s", name)
+
+        with entry.engine.connect() as conn:
+            raw = conn.connection
+
+            def probe(sql: str) -> RawResult:
+                try:
+                    return run_select(raw, sql, 100, 5)
+                except QueryExecutionError:
+                    try:  
+                        raw.rollback()
+                    except Exception:
+                        pass
+                    raise
+
+            enrich_schema(schema, probe, self.settings)
+        logger.info("introspected %s: %d objects in %.2fs", entry.label, len(schema.tables), time.perf_counter() - started)
+        return schema
+
+    
+    def run_query(self, connection_id: str, sql: str, max_rows: int, timeout_seconds: int) -> RawResult:
+        """Run *already validated* SQL. Callers must go through GuardedExecutor."""
+        engine = self.get_engine(connection_id)
+        try:
+            with engine.connect() as conn:
+                raw = conn.connection
+                try:
+                    return run_select(raw, sql, max_rows, timeout_seconds)
+                finally:
+                    try:
+                        raw.rollback()
+                    except Exception:
+                        pass
+        except QueryExecutionError:
+            raise
+        except Exception as exc:  
+            raise QueryExecutionError(f"Database connection error: {clean_db_error(exc)}") from exc
+
+    
+    def build_table_select(self, connection_id: str, table_name: str) -> str:
+        schema = self.get_schema(connection_id)
+        table = schema.get_table(table_name)
+        if table is None:
+            raise NotFoundError(f"Table '{table_name}' not found.")
+        db_type = self.get_db_type(connection_id)
+        sql = f"SELECT * FROM {quote_identifier(table.name, db_type)}"
+        if table.primary_keys:
+            sql += " ORDER BY " + ", ".join(quote_identifier(c, db_type) for c in table.primary_keys)
+        return sql
+
+    def get_table_data(self, connection_id: str, table_name: str, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+        schema = self.get_schema(connection_id)
+        table = schema.get_table(table_name)
+        if table is None:
+            raise NotFoundError(f"Table '{table_name}' not found.")
+        limit = max(1, min(int(limit), self.settings.max_rows))
+        offset = max(0, int(offset))
+        sql = f"{self.build_table_select(connection_id, table.name)} LIMIT {limit} OFFSET {offset}"
+        raw = self.run_query(connection_id, sql, limit, self.settings.query_timeout_seconds)
+        rows, redacted = redact_rows(raw.columns, raw.rows, schema.restricted_columns(), self.settings.restricted_column_re)
+        raw.rows, raw.redacted_columns = rows, redacted
+
+        total = table.row_count
+        try:
+            db_type = self.get_db_type(connection_id)
+            count = self.run_query(
+                connection_id, f"SELECT COUNT(*) AS n FROM {quote_identifier(table.name, db_type)}", 1,
+                self.settings.query_timeout_seconds,
+            )
+            total = int(count.rows[0]["n"])
+        except Exception:
+            pass
+        return {**raw.to_dict(), "table": table.name, "total_rows": total, "limit": limit, "offset": offset}

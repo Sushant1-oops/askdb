@@ -1,75 +1,70 @@
-# Text-to-SQL Project Documentation
+# AskDB — design notes
 
-## 1. Project Overview
-The **Text-to-SQL** project is a comprehensive full-stack application that seamlessly bridges the gap between natural language and database querying. It allows users to connect to various relational databases and query them simply by asking questions in plain English. By leveraging advanced local Large Language Models (LLMs), the application translates human intent into accurate, executable SQL queries, making data accessible to both technical and non-technical users.
+## 1. Goal
+Let non-experts query a SQL database in natural language **safely** and **verifiably**: every answer shows
+the SQL that produced it, what guardrails it passed, and an independent review of its correctness.
 
-## 2. Key Functionalities
+## 2. Architecture
 
-### 🔌 Database Connection Management
-- **Multi-Database Support**: Securely connect to PostgreSQL, MySQL, and SQLite databases.
-- **Connection Pooling**: Optimized backend handling for fast and reliable query execution.
+```
+Browser (React)                              FastAPI
+  routes ─ WorkspaceProvider ─ lib/api.ts ──► routers/*  (thin)
+                                                  │
+                                                  ▼
+                                          services/pipeline.py
+   input guard → schema link → generate → GuardedExecutor → repair loop → judge → pick best → summarise
+                                              │                    │
+                                      guardrails.py          database_service.py
+                                      (lexer + policy)       (read-only sessions, SQLAlchemy)
+```
 
-### 📊 Schema Exploration
-- **Visual Insights**: Browse existing tables, columns, and relationships directly from the UI.
-- **Schema Caching**: The backend caches the database schema per connection to ensure optimal performance during AI inference.
+Principles: routers hold no logic; the pipeline depends on narrow interfaces (`LLM`, `DatabaseBackend`) so
+it is fully testable with a scripted LLM and a SQLite backend; one `GuardedExecutor` is the only path to a
+database (AI pipeline, SQL editor and exports all share it).
 
-### 🤖 AI-Powered Query Generation
-- **Natural Language Processing**: Submit plain English questions (e.g., "Show me all customers who made purchases last month").
-- **Accurate SQL Translation**: The backend utilizes specialized coding LLMs (like `sqlcoder`) via Ollama to generate precise SQL statements based on the specific database schema.
+## 3. Guardrails
+| Layer | Mechanism |
+| --- | --- |
+| Input | length cap, prompt-injection patterns, explicit write intent ("delete all…") rejected before any LLM call |
+| SQL policy | tokenizer (strings / comments / quoted identifiers / MySQL backslash escapes / Postgres `E''` and `$$`), single statement, SELECT/WITH only, no `INSERT/UPDATE/DELETE/…` anywhere (blocks data-modifying CTEs, `SELECT INTO`, `FOR UPDATE`), dangerous functions (`pg_sleep`, `load_extension`, `LOAD_FILE`…), system catalogs, unknown tables, restricted columns |
+| Executed text | rebuilt from the tokens that were inspected (comments stripped), so validated == executed |
+| Database | read-only session (`default_transaction_read_only` / `READ ONLY` / `PRAGMA query_only`), statement timeout |
+| Result | row cap (`LIMIT max+1` injected so truncation is detectable), restricted columns masked |
+| Prompt | restricted columns never shown to the LLM; DB-derived text is labelled as data |
 
-### ⚡ Query Execution & Visualization
-- **Direct SQL Execution**: Run the AI-generated queries or manually write/edit your own SQL commands.
-- **Data Tables**: View the returned database records in clean, readable, and responsive tabular formats on the frontend.
+Restricted columns are those matching `RESTRICTED_COLUMN_PATTERN` (passwords, tokens, secrets, SSN, card numbers…).
 
-### 📥 Data Export
-- **Multiple Formats**: Instantly export your query results into CSV, Excel, or PDF files for external reporting and analysis.
+## 4. Query quality
+- **Schema linking** for large databases (name/column/value matching + FK neighbours).
+- **Data-derived hints**: low-cardinality values and date ranges are in the prompt, so `'Completed'` is not guessed as `'completed'`, and "last month" can be reconciled with stale data.
+- **Structured output** with `unanswerable` / `ambiguous` states instead of hallucinated SQL.
+- **Repair loop**: guard and DB errors are fed back (bounded by `MAX_REPAIR_ATTEMPTS`).
+- **Follow-up context**: recent turns and their SQL are included ("now by month").
 
-## 3. Technology Stack
+## 5. LLM-as-judge
+An independent model (different family by default) receives question, schema slice, SQL, assumptions, the
+**observed** result preview and deterministic signals (0 rows, duplicate rows from join fan-out, all-NULL
+columns, truncation). It returns verdict + score + per-criterion scores + issues + a fix suggestion.
+`revise`/`fail` or `score < JUDGE_MIN_SCORE` triggers one regeneration (`MAX_JUDGE_REVISIONS`); the
+highest-scoring *executed* candidate is returned, never blindly the latest. If the judge is down, the answer is
+still delivered and labelled "unreviewed". Caveat: an LLM judge reduces, not removes, wrong answers.
 
-### Frontend (Client-Side)
-- **Framework**: React.js powered by Vite for lightning-fast development and optimized builds.
-- **Language**: JavaScript / TypeScript.
-- **Styling**: Custom Vanilla CSS featuring a modern, dark-themed, glassmorphism design system.
-- **Routing**: `react-router-dom` for seamless page navigation.
-- **Key Libraries**: 
-  - `lucide-react` for beautiful iconography.
-  - `react-syntax-highlighter` for styling and highlighting generated SQL code blocks.
-  - `react-hot-toast` for elegant user notifications and error handling.
+## 6. Accuracy of answers and charts
+The summariser may only use numbers present in the rows. Charts are specified as *column names*; the backend
+validates them against the real result (existing columns, numeric y-axes, pie ≤ 8 slices) or falls back to a
+deterministic heuristic. The frontend plots the actual rows — no data is transcribed by the model.
 
-### Backend (Server-Side & AI)
-- **Framework**: FastAPI (Python) - known for high performance and automatic API documentation generation.
-- **AI Integration**: Ollama (Local LLM engine) running models like `sqlcoder`, `codellama:7b`, or `deepseek-coder:6.7b`.
-- **Database Drivers**: Built-in Python drivers to interface with PostgreSQL, MySQL, and SQLite.
+## 7. Frontend
+Real routes (`/`, `/ask`, `/sql`, `/schema`, `/tables`, `/connections`) under a shared shell. TanStack Query owns
+server state; `WorkspaceProvider` owns the active connection, the Ask AI conversation (so it survives
+navigation and in-flight requests) and hand-off drafts. All states are handled: loading skeletons, empty,
+error with retry, offline backend banner, stale connection after a backend restart.
 
-## 4. Application Workflow
+## 8. Privacy
+With AI features on, schema text, optionally sample values (`LLM_INCLUDE_SAMPLES`) and a preview of result rows
+(`RESULT_ROWS_TO_LLM`) are sent to the LLM provider. Set both to off/0 for sensitive data.
 
-The end-to-end workflow of the application functions as follows:
-
-1. **Environment Setup & Initialization**:
-   - The user starts the local Ollama service with a pulled SQL generation model (e.g., `ollama pull sqlcoder`).
-   - The FastAPI backend server is launched, exposing the REST API endpoints.
-   - The React frontend is started via Vite (`npm run dev`).
-
-2. **Connecting to the Database**:
-   - The user inputs their database credentials (host, port, username, password, db name) in the frontend UI.
-   - The frontend sends a `POST` request to the backend. The backend establishes a secure connection pool and retrieves the database schema.
-
-3. **Schema Mapping**:
-   - The backend maps the tables and columns and caches this schema. This context is crucial for the LLM to understand what data is available.
-
-4. **Natural Language Querying**:
-   - The user types a question into the chat/query interface.
-   - The frontend transmits the question to the backend (`/api/query/natural-language`).
-   - The backend constructs a highly detailed prompt containing the user's question alongside the cached database schema, and sends it to the local Ollama LLM.
-   - The LLM processes the prompt and returns a properly formatted SQL query.
-
-5. **Execution & Rendering**:
-   - The generated SQL query is passed back to the frontend, where it is highlighted for the user to review.
-   - The user can choose to execute the query (`/api/query/sql`), prompting the backend to run the SQL command directly against the connected database.
-   - The resulting rows are returned as JSON and rendered in a dynamic data table on the UI.
-
-6. **Exporting Results**:
-   - If the user needs the data offline, they click the export button. The frontend requests a file generation (`/api/export/query`), and the backend streams back a downloadable CSV, Excel, or PDF document.
-
-## 5. Summary
-This project provides a robust, production-ready environment that democratizes data access. By coupling a sleek, modern React frontend with a high-performance FastAPI backend and powerful local AI models, it completely removes the necessity of knowing SQL to extract meaningful insights from relational databases.
+## 9. Not included (by design / future work)
+User authentication and per-user connection ownership; persistence of connections and history; credential
+encryption at rest; non-default Postgres schemas; integration tests against live Postgres/MySQL; streaming
+responses; an evaluation harness (golden question/SQL pairs) to measure accuracy over time.
